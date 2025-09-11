@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Attention Benchmark Analysis</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Chosen Palette: "Warm Neutrals" -->
+    <!-- Application Structure Plan: [The application is designed as an interactive dashboard. This structure was chosen to allow users to directly explore the relationships between model parameters (d_model, sequence length) and performance metrics (time, memory). The main view consists of a central, dynamic line chart, with controls for selecting the metric and filtering by d_model. This allows for direct comparison and trend analysis, which is more intuitive than a static table. A collapsible section contains the detailed text analysis, providing context without cluttering the primary view. The user flow is simple: select a metric, see the result, compare model sizes, and expand the analysis for deeper understanding.] -->
+    <!-- Visualization & Content Choices: [Source Info: Benchmark table data -> Goal: Compare performance trends -> Viz: Multi-line chart -> Interaction: Radio buttons to switch metric (Y-axis), Checkboxes to toggle lines (d_model) -> Justification: Line charts are ideal for showing trends over a continuous variable (sequence length). Using multiple lines allows for easy comparison between different categories (d_model). Interactive controls empower the user to isolate and focus on the data they care about. -> Library: Chart.js (Canvas). Source Info: Analysis text -> Goal: Explain the 'why' behind the trends -> Presentation: Collapsible HTML details/summary element -> Interaction: Click to expand/collapse -> Justification: Hides detailed text by default to keep the UI clean, but makes it easily accessible for users seeking deeper context.] -->
+    <!-- CONFIRMATION: NO SVG graphics used. NO Mermaid JS used. -->
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #fdfcfb;
+            color: #1f2937;
+        }
+        .chart-container {
+            position: relative;
+            width: 100%;
+            max-width: 1000px;
+            margin-left: auto;
+            margin-right: auto;
+            height: 50vh;
+            max-height: 500px;
+        }
+        details > summary {
+            cursor: pointer;
+            list-style: none;
+        }
+        details > summary::-webkit-details-marker {
+            display: none;
+        }
+    </style>
+</head>
+<body class="antialiased">
+    <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-8 md:py-12">
+
+        <header class="text-center mb-10 md:mb-16">
+            <h1 class="text-4xl md:text-5xl font-bold tracking-tight text-gray-800">Self-Attention Benchmark Analysis</h1>
+            <p class="mt-3 text-lg text-gray-600 max-w-3xl mx-auto">An interactive exploration of performance and memory trade-offs in the self-attention mechanism.</p>
+        </header>
+
+        <main>
+            <section id="interactive-dashboard" class="bg-white rounded-2xl shadow-lg p-6 md:p-8">
+                <div class="grid grid-cols-1 lg:grid-cols-4 gap-8">
+                    <div class="lg:col-span-1">
+                        <h2 class="text-xl font-semibold text-gray-800 mb-4">Controls</h2>
+                        <div class="space-y-6">
+                            <div>
+                                <label class="text-md font-medium text-gray-700">Metric to Visualize</label>
+                                <fieldset class="mt-2">
+                                    <legend class="sr-only">Metric selection</legend>
+                                    <div class="space-y-2" id="metric-selector">
+                                        <div class="flex items-center">
+                                            <input id="forward_ms" name="metric" type="radio" value="forward_ms" checked class="h-4 w-4 text-indigo-600 border-gray-300 focus:ring-indigo-500">
+                                            <label for="forward_ms" class="ml-3 block text-sm font-medium text-gray-700">Forward Pass (ms)</label>
+                                        </div>
+                                        <div class="flex items-center">
+                                            <input id="backward_ms" name="metric" type="radio" value="backward_ms" class="h-4 w-4 text-indigo-600 border-gray-300 focus:ring-indigo-500">
+                                            <label for="backward_ms" class="ml-3 block text-sm font-medium text-gray-700">Backward Pass (ms)</label>
+                                        </div>
+                                        <div class="flex items-center">
+                                            <input id="memory_mb" name="metric" type="radio" value="memory_mb" class="h-4 w-4 text-indigo-600 border-gray-300 focus:ring-indigo-500">
+                                            <label for="memory_mb" class="ml-3 block text-sm font-medium text-gray-700">Memory Usage (MB)</label>
+                                        </div>
+                                    </div>
+                                </fieldset>
+                            </div>
+                             <div>
+                                <label class="text-md font-medium text-gray-700">Model Dimension ($d_{model}$)</label>
+                                <fieldset class="mt-2">
+                                    <legend class="sr-only">Model Dimension Filter</legend>
+                                    <div class="space-y-2" id="d_model-selector">
+                                    </div>
+                                </fieldset>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="lg:col-span-3">
+                         <p class="text-gray-600 mb-4 text-center">This chart illustrates how the selected performance metric changes as the sequence length increases for various model dimensions ($d_{model}$). Use the controls to switch metrics and compare different model configurations to observe the performance and memory scaling properties of self-attention.</p>
+                        <div class="chart-container">
+                            <canvas id="benchmarkChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </section>
+            
+            <section id="analysis" class="mt-12">
+                 <div class="bg-white rounded-2xl shadow-lg">
+                    <details class="p-6 md:p-8">
+                        <summary class="flex justify-between items-center font-semibold text-xl text-gray-800">
+                            <span>Analysis of Memory Usage</span>
+                            <span class="text-indigo-600 text-sm">Click to expand</span>
+                        </summary>
+                        <div class="mt-6 prose max-w-none text-gray-600">
+                            <p>This section explains the underlying reasons for the performance and memory trends observed in the chart, particularly the critical impact of sequence length.</p>
+                            <p>The most memory-intensive operation in a standard self-attention forward pass is the creation of the attention score matrix, which is computed as a batched matrix multiplication of the queries ($Q$) and keys ($K$). Given that the queries and keys both have the shape of (batch size, sequence length, embedding dimension) or $(B, S, D)$, the resulting score matrix has a shape of $(B, S, S)$. For a backward pass, this score matrix, along with the other intermediate tensors, must be stored to compute the gradients.</p>
+                            <p>The memory for this intermediate score matrix scales quadratically with the sequence length ($O(B \cdot S^2)$). For example, consider the configuration with $B=8, D=128$, and $S=16384$. The score matrix would have a size of $8 \times 16384 \times 16384$. Given that each element is a 4-byte floating-point number (FP32), the memory required for this one tensor alone would be approximately $8 \times 16384 \times 16384 \times 4 \text{ bytes} \approx 8.59 \text{ GB}$. When you factor in the memory for the input tensors, the gradients, and other intermediate values, it's clear why out-of-memory (OOM) errors occur at high sequence lengths, as this quickly exceeds the memory capacity of most GPUs.</p>
+                            <p>The memory saved for the backward pass changes with the sequence length in a non-linear way. As the sequence length increases, the amount of memory needed to store the intermediate activation tensors for the backward pass (especially the $B \times S \times S$ attention score matrix) grows at a much faster rate than the memory for the input tensors. To eliminate this memory cost, techniques such as <strong>gradient checkpointing</strong> or more advanced methods like <strong>FlashAttention</strong> are used. Gradient checkpointing re-computes the necessary intermediate tensors during the backward pass instead of storing them, trading computation time for a significant reduction in memory. FlashAttention, on the other hand, reorders the computation of the attention mechanism to avoid storing the large $S \times S$ attention matrix altogether. These methods are crucial for training large language models with long context windows.</p>
+                        </div>
+                    </details>
+                </div>
+            </section>
+
+        </main>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const benchmarkData = [
+                { d_model: 16, seq_len: 256, forward_ms: 0.1177, backward_ms: 0.2109, memory_mb: 19.25 },
+                { d_model: 16, seq_len: 1024, forward_ms: 0.3615, backward_ms: 0.5382, memory_mb: 52.25 },
+                { d_model: 16, seq_len: 4096, forward_ms: 4.3446, backward_ms: 5.7369, memory_mb: 544.25 },
+                { d_model: 16, seq_len: 8192, forward_ms: 16.2464, backward_ms: 20.6329, memory_mb: 2096.25 },
+                { d_model: 16, seq_len: 16384, forward_ms: 63.1694, backward_ms: 86.6405, memory_mb: 8272.25 },
+                { d_model: 32, seq_len: 256, forward_ms: 0.1177, backward_ms: 0.2109, memory_mb: 19.25 },
+                { d_model: 32, seq_len: 1024, forward_ms: 0.3615, backward_ms: 0.5382, memory_mb: 52.25 },
+                { d_model: 32, seq_len: 4096, forward_ms: 4.3446, backward_ms: 5.7369, memory_mb: 544.25 },
+                { d_model: 32, seq_len: 8192, forward_ms: 16.2464, backward_ms: 20.6329, memory_mb: 2096.25 },
+                { d_model: 32, seq_len: 16384, forward_ms: 63.1694, backward_ms: 86.6405, memory_mb: 8272.25 },
+                { d_model: 64, seq_len: 256, forward_ms: 0.1173, backward_ms: 0.2014, memory_mb: 20.25 },
+                { d_model: 64, seq_len: 1024, forward_ms: 0.3890, backward_ms: 0.5667, memory_mb: 56.25 },
+                { d_model: 64, seq_len: 4096, forward_ms: 4.8551, backward_ms: 6.1615, memory_mb: 560.25 },
+                { d_model: 64, seq_len: 8192, forward_ms: 18.3644, backward_ms: 22.5889, memory_mb: 2128.25 },
+                { d_model: 64, seq_len: 16384, forward_ms: 71.3341, backward_ms: 94.4182, memory_mb: 8336.25 },
+                { d_model: 128, seq_len: 256, forward_ms: 0.1209, backward_ms: 0.2035, memory_mb: 22.25 },
+                { d_model: 128, seq_len: 1024, forward_ms: 0.4473, backward_ms: 0.6401, memory_mb: 64.25 },
+                { d_model: 128, seq_len: 4096, forward_ms: 5.8116, backward_ms: 7.0341, memory_mb: 592.25 },
+                { d_model: 128, seq_len: 8192, forward_ms: 22.2762, backward_ms: 26.2085, memory_mb: 2192.25 },
+                { d_model: 128, seq_len: 16384, forward_ms: 86.6420, backward_ms: 109.3510, memory_mb: 8464.25 },
+            ];
+
+            const ctx = document.getElementById('benchmarkChart').getContext('2d');
+            let benchmarkChart;
+
+            const dModels = [...new Set(benchmarkData.map(d => d.d_model))];
+            const seqLens = [...new Set(benchmarkData.map(d => d.seq_len))].sort((a, b) => a - b);
+            
+            const colors = {
+                16: 'rgba(59, 130, 246, 0.8)',
+                32: 'rgba(239, 68, 68, 0.8)',
+                64: 'rgba(16, 185, 129, 0.8)',
+                128: 'rgba(249, 115, 22, 0.8)',
+            };
+            const borderColors = {
+                16: 'rgba(59, 130, 246, 1)',
+                32: 'rgba(239, 68, 68, 1)',
+                64: 'rgba(16, 185, 129, 1)',
+                128: 'rgba(249, 115, 22, 1)',
+            };
+
+            const dModelSelector = document.getElementById('d_model-selector');
+            dModels.forEach(d_model => {
+                const div = document.createElement('div');
+                div.className = 'flex items-center';
+                div.innerHTML = `
+                    <input id="d_model_${d_model}" name="d_model" type="checkbox" value="${d_model}" checked class="h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500">
+                    <label for="d_model_${d_model}" class="ml-3 block text-sm font-medium text-gray-700">${d_model}</label>
+                `;
+                dModelSelector.appendChild(div);
+            });
+
+            const metricLabels = {
+                forward_ms: 'Time (ms)',
+                backward_ms: 'Time (ms)',
+                memory_mb: 'Memory (MB)',
+            };
+
+            function updateChart() {
+                const selectedMetric = document.querySelector('input[name="metric"]:checked').value;
+                const selectedDModels = Array.from(document.querySelectorAll('input[name="d_model"]:checked')).map(cb => parseInt(cb.value));
+
+                const datasets = selectedDModels.map(d_model => {
+                    const dataForDModel = benchmarkData.filter(d => d.d_model === d_model);
+                    return {
+                        label: `d_model = ${d_model}`,
+                        data: dataForDModel.map(d => d[selectedMetric]),
+                        borderColor: borderColors[d_model],
+                        backgroundColor: colors[d_model],
+                        tension: 0.1,
+                        borderWidth: 2,
+                        pointRadius: 4,
+                        pointHoverRadius: 6,
+                    };
+                });
+
+                if (benchmarkChart) {
+                    benchmarkChart.data.labels = seqLens;
+                    benchmarkChart.data.datasets = datasets;
+                    benchmarkChart.options.scales.y.title.text = metricLabels[selectedMetric];
+                    benchmarkChart.update();
+                } else {
+                    benchmarkChart = new Chart(ctx, {
+                        type: 'line',
+                        data: {
+                            labels: seqLens,
+                            datasets: datasets,
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            scales: {
+                                x: {
+                                    title: {
+                                        display: true,
+                                        text: 'Sequence Length',
+                                        font: { size: 14 }
+                                    },
+                                    grid: {
+                                        display: false,
+                                    }
+                                },
+                                y: {
+                                    beginAtZero: true,
+                                    title: {
+                                        display: true,
+                                        text: metricLabels[selectedMetric],
+                                        font: { size: 14 }
+                                    },
+                                    grid: {
+                                        color: '#e5e7eb'
+                                    }
+                                }
+                            },
+                            plugins: {
+                                legend: {
+                                    position: 'top',
+                                },
+                                tooltip: {
+                                    enabled: true,
+                                    mode: 'index',
+                                    intersect: false,
+                                    callbacks: {
+                                        label: function(context) {
+                                            let label = context.dataset.label || '';
+                                            if (label) {
+                                                label += ': ';
+                                            }
+                                            if (context.parsed.y !== null) {
+                                                const unit = selectedMetric.includes('ms') ? 'ms' : 'MB';
+                                                label += `${context.parsed.y.toFixed(2)} ${unit}`;
+                                            }
+                                            return label;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+
+            document.getElementById('metric-selector').addEventListener('change', updateChart);
+            document.getElementById('d_model-selector').addEventListener('change', updateChart);
+            
+            updateChart();
+        });
+    </script>
+</body>
+</html>
