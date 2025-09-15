@@ -166,3 +166,99 @@ class FlashAttentionTriton(torch.autograd.Function):
     def backward(ctx, grad_output, grad_L):
         # Backward pass logic goes here
         return None, None, None, None, None, None
+
+# Adapter function to match the test suite's import structure
+def get_flashattention_autograd_function_triton():
+    return FlashAttentionTriton
+
+
+def _attention_and_lse(q, k, v, is_causal=False):
+    n_queries = q.shape[-2]
+    n_keys = k.shape[-2]
+    d = q.shape[-1]
+    scale = 1 / (d ** 0.5)
+    S = torch.einsum(q, k, '... q d, ... k d -> ... q k') * scale
+    if is_causal:
+        S = torch.where(
+            torch.arange(n_queries, device=S.device)[None, :, None] >= torch.arange(n_keys, device=S.device)[None, None, :],
+            S,
+            -1e6
+        )
+    P = torch.softmax(S, dim=-1)
+    o = torch.einsum(P, v, '... q k, ... k d -> ... q d')
+    L = torch.logsumexp(S, dim=-1)
+    return o, L
+
+
+def _make_attn_inputs(device=None):
+    torch.random.manual_seed(0)
+    batch_size = 4
+    n_queries = 128
+    n_keys = 128
+    D = 64
+    q = torch.randn(batch_size, n_queries, D, device=device, requires_grad=True)
+    k = torch.randn(batch_size, n_keys, D, device=device, requires_grad=True)
+    v = torch.randn(batch_size, n_keys, D, device=device, requires_grad=True)
+    _do = torch.randn(batch_size, n_queries, D, device=device)
+    return q, k, v, _do
+
+
+def _test_flash_forward_pass(impl, device="cpu", is_causal=False):
+    q, k, v, _do = _make_attn_inputs(device)
+    o, l = impl(q, k, v, is_causal)
+
+    # In the original test, `l` is extracted from saved tensors.
+    # The provided FlashAttentionTriton returns `o, l` directly.
+    # We will use the direct return for simplicity.
+
+    o_ref, l_ref = _attention_and_lse(q, k, v, is_causal)
+
+    # Check for close approximation
+    try:
+        torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(l, l_ref, rtol=1e-2, atol=1e-2)
+        return True, None
+    except AssertionError as e:
+        return False, str(e)
+
+
+def test_flash_forward_pass_triton(is_causal):
+    # This is the actual test function from the user's prompt
+    return _test_flash_forward_pass(
+        get_flashattention_autograd_function_triton().apply,
+        device="cuda",
+        is_causal=is_causal,
+    )
+
+
+if __name__ == "__main__":
+    import sys
+    if not torch.cuda.is_available():
+        print("A GPU must be available to run this test. Skipping.")
+        sys.exit(0)
+
+    print("Running FlashAttention Triton forward pass test...")
+    print("--------------------------------------------------")
+
+    # Test for non-causal attention
+    is_causal = False
+    print(f"Testing with is_causal={is_causal}...")
+    success, error_msg = test_flash_forward_pass_triton(is_causal)
+    if success:
+        print("✅ Non-causal forward pass test PASSED!")
+    else:
+        print("❌ Non-causal forward pass test FAILED.")
+        print("Error details:", error_msg)
+
+    print("\n" + "=" * 50 + "\n")
+
+    # Test for causal attention
+    is_causal = True
+    print(f"Testing with is_causal={is_causal}...")
+    success, error_msg = test_flash_forward_pass_triton(is_causal)
+    if success:
+        print("✅ Causal forward pass test PASSED!")
+    else:
+        print("❌ Causal forward pass test FAILED.")
+        print("Error details:", error_msg)
+        print("\nNote: The provided Triton kernel does not implement causality, so this test will fail.")
