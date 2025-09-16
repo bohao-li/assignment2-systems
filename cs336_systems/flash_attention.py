@@ -1,271 +1,154 @@
 import torch
-import triton
-import triton.language as tl
 
-
-# Triton kernel stub
-@triton.jit
-def flash_fwd_kernel(
-    Q_ptr,
-    K_ptr,
-    V_ptr,
-    O_ptr,
-    L_ptr,
-    stride_qb,
-    stride_qq,
-    stride_qd,
-    stride_kb,
-    stride_kk,
-    stride_kd,
-    stride_vb,
-    stride_vk,
-    stride_vd,
-    stride_ob,
-    stride_oq,
-    stride_od,
-    stride_lb,
-    stride_lq,
-    N_QUERIES,
-    N_KEYS,
-    scale,
-    D: tl.constexpr,
-    Q_TILE_SIZE: tl.constexpr,
-    K_TILE_SIZE: tl.constexpr,
-):
-    # Program indices
-    query_tile_index = tl.program_id(0)
-    batch_index = tl.program_id(1)
-
-    # Offset each pointer with the corresponding batch index
-    # multiplied with the batch stride for each tensor
-    Q_block_ptr = tl.make_block_ptr(
-        Q_ptr + batch_index * stride_qb,
-        shape=(N_QUERIES, D),
-        strides=(stride_qq, stride_qd),
-        offsets=(query_tile_index * Q_TILE_SIZE, 0),
-        block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0),
-    )
-
-    K_block_ptr = tl.make_block_ptr(
-        K_ptr + batch_index * stride_kb,
-        shape=(N_KEYS, D),
-        strides=(stride_kk, stride_kd),
-        offsets=(0, 0),
-        block_shape=(K_TILE_SIZE, D),
-        order=(1, 0),
-    )
-
-    V_block_ptr = tl.make_block_ptr(
-        V_ptr + batch_index * stride_vb,
-        shape=(N_KEYS, D),
-        strides=(stride_vk, stride_vd),
-        offsets=(0, 0),
-        block_shape=(K_TILE_SIZE, D),
-        order=(1, 0),
-    )
-
-    O_block_ptr = tl.make_block_ptr(
-        O_ptr + batch_index * stride_ob,
-        shape=(N_QUERIES, D),
-        strides=(stride_oq, stride_od),
-        offsets=(query_tile_index * Q_TILE_SIZE, 0),
-        block_shape=(Q_TILE_SIZE, D),
-        order=(1, 0),
-    )
-
-    L_block_ptr = tl.make_block_ptr(
-        L_ptr + batch_index * stride_lb,
-        shape=(N_QUERIES, 1),
-        strides=(stride_lq, 1),
-        offsets=(query_tile_index * Q_TILE_SIZE, 0),
-        block_shape=(Q_TILE_SIZE, 1),
-        order=(1, 0),
-    )
-
-    q = tl.load(Q_block_ptr).to(tl.float32)
-
-    o_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
-    l_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
-    m_i = tl.full((Q_TILE_SIZE,), -float("inf"), dtype=tl.float32)
-
-    for _ in range(0, N_KEYS, K_TILE_SIZE):
-        # Load K and V, cast them to float32
-        k = tl.load(K_block_ptr).to(tl.float32)
-        v = tl.load(V_block_ptr).to(tl.float32)
-
-        s = tl.dot(q, tl.trans(k)) * scale
-
-        m_i_new = tl.maximum(m_i, tl.max(s, 1))
-        s = tl.exp(s - m_i_new[:, None])
-
-        l_i = tl.exp(m_i - m_i_new) * l_i + tl.sum(s, 1)
-        o_i = tl.exp(m_i - m_i_new)[:, None] * o_i + tl.dot(s, v)
-        m_i = m_i_new
-
-        K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
-        V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
-
-    o_final = o_i / l_i[:, None]
-    l_final = tl.log(l_i) + m_i
-
-    tl.store(O_block_ptr, o_final)
-    tl.store(L_block_ptr, l_final[:, None])
-
-
-# torch.autograd.Function subclass stub
-class FlashAttentionTriton(torch.autograd.Function):
+class FlashAttentionForwardPass(torch.autograd.Function):
+    """
+    A pure PyTorch implementation of the FlashAttention-2 forward pass as an
+    autograd.Function. This is intended for debugging purposes.
+    """
     @staticmethod
-    def forward(ctx, Q, K, V, scale, Q_TILE_SIZE=128, K_TILE_SIZE=128):
-        # Store for backward pass (if needed)
-        # ctx.save_for_backward(...)
+    def forward(ctx, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, is_causal: bool = False):
+        batch_size = Q.shape[0]
+        Br = 128
+        Bc = 128
 
-        # Get tensor properties
-        batch_size, N_QUERIES, D = Q.shape
-        _, N_KEYS, _ = K.shape
+        # split Q into Br tiles, K and V into Bc tiles
+        Q_tiles = Q.split(Br, dim=1)
+        K_tiles = K.split(Bc, dim=1)
+        V_tiles = V.split(Bc, dim=1)
+        
+        # We will collect the computed O_i tiles in this list
+        O_list = []
+        L_list = []
 
-        # Allocate output tensors
-        O = torch.empty_like(Q)
-        L = torch.empty((batch_size, N_QUERIES), device=Q.device, dtype=torch.float32)
+        Tr = Q.shape[1] // Br
+        Tc = K.shape[1] // Bc
 
-        # Set up the launch grid
-        grid = (triton.cdiv(N_QUERIES, Q_TILE_SIZE), batch_size)
+        for i in range(0, Tr):
+            # pretend we're loading qtiles from HBM
+            Q_tile = Q_tiles[i]
 
-        # Launch the Triton kernel
-        flash_fwd_kernel[grid](
-            Q,
-            K,
-            V,
-            O,
-            L,
-            Q.stride(0),
-            Q.stride(1),
-            Q.stride(2),
-            K.stride(0),
-            K.stride(1),
-            K.stride(2),
-            V.stride(0),
-            V.stride(1),
-            V.stride(2),
-            O.stride(0),
-            O.stride(1),
-            O.stride(2),
-            L.stride(0),
-            L.stride(1),
-            N_QUERIES,
-            N_KEYS,
-            scale,
-            D,
-            Q_TILE_SIZE,
-            K_TILE_SIZE,
-        )
-        return O, L
+            # pretend we're initializing Otile, l_i and m_i on SRAM
+            O_i = torch.zeros_like(Q_tile)
+            l_i = torch.zeros(batch_size, Br, device=Q.device)
+            m_i = torch.full((batch_size, Br), float('-inf'), device=Q.device)
+
+            for j in range(0, Tc):
+                # pretend we're loading ktiles and vtiles from HBM
+                K_tile = K_tiles[j]
+                V_tile = V_tiles[j]
+
+                # compute attention scores
+                S_ij = torch.einsum('b r d, b c d -> b r c', Q_tile, K_tile) / (Q.shape[-1] ** 0.5)
+                
+                m_i_prev = m_i.clone()
+                m_i = torch.maximum(m_i, S_ij.amax(dim=-1))
+                
+                P_tilde_ij = torch.exp(S_ij - m_i.unsqueeze(-1))
+                
+                # Note: There's a slight error in your l_i update formula.
+                # It should be based on the sum of P_tilde_ij values.
+                # A more robust logsumexp update is:
+                l_i = torch.exp(m_i_prev - m_i) * l_i + P_tilde_ij.sum(dim=-1)
+
+                O_i = torch.exp(m_i_prev - m_i).unsqueeze(-1) * O_i + P_tilde_ij @ V_tile
+            
+            # Final normalization of O_i
+            O_i = O_i / l_i.unsqueeze(-1)
+            
+            # Compute final L_i
+            L_i = torch.log(l_i) + m_i
+
+            # Append the computed tiles to the lists
+            O_list.append(O_i)
+            L_list.append(L_i)
+        
+        # Concatenate the lists of tensors back into single tensors
+        O = torch.cat(O_list, dim=1)
+        L = torch.cat(L_list, dim=1)
+
+        ctx.save_for_backward(Q, K, V, O, L)
+        ctx.scale = 1 / (Q.shape[-1] ** 0.5)
+        ctx.is_causal = is_causal
+
+        return O
 
     @staticmethod
-    def backward(ctx, grad_output, grad_L):
-        # Backward pass logic goes here
-        return None, None, None, None, None, None
-
-
-# Adapter function to match the test suite's import structure
-def get_flashattention_autograd_function_triton():
-    return FlashAttentionTriton
-
-
-import torch
-
-
-def _attention_and_lse(q, k, v, is_causal=False):
-    n_queries = q.shape[-2]
-    n_keys = k.shape[-2]
-    d = q.shape[-1]
-    scale = 1 / (d**0.5)
-
-    # Replaces S = torch.einsum(q, k, "... q d, ... k d -> ... q k") * scale
-    k_transposed = k.transpose(-2, -1)
-    S = torch.matmul(q, k_transposed) * scale
-
-    if is_causal:
-        S = torch.where(
-            torch.arange(n_queries, device=S.device)[None, :, None]
-            >= torch.arange(n_keys, device=S.device)[None, None, :],
-            S,
-            torch.full_like(S, float("-inf")),
-        )
-
-    # Use torch.softmax on the last dimension
-    P = torch.softmax(S, dim=-1)
-
-    # Replaces o = torch.einsum(P, v, "... q k, ... k d -> ... q d")
-    o = torch.matmul(P, v)
-
-    # torch.logsumexp is still the same
-    L = torch.logsumexp(S, dim=-1)
-
-    return o, L
-
-
-def _make_attn_inputs(device=None):
-    torch.random.manual_seed(0)
-    batch_size = 4
-    n_queries = 128
-    n_keys = 128
-    D = 64
-    q = torch.randn(batch_size, n_queries, D, device=device, requires_grad=True)
-    k = torch.randn(batch_size, n_keys, D, device=device, requires_grad=True)
-    v = torch.randn(batch_size, n_keys, D, device=device, requires_grad=True)
-    _do = torch.randn(batch_size, n_queries, D, device=device)
-    return q, k, v, _do
-
-
-def _test_flash_forward_pass(impl, device="cpu", is_causal=False):
-    q, k, v, _do = _make_attn_inputs(device)
-    D = q.shape[-1]
-    scale = 1.0 / (D**0.5)
-    o, l = impl(q, k, v, scale)
-
-    # In the original test, `l` is extracted from saved tensors.
-    # The provided FlashAttentionTriton returns `o, l` directly.
-    # We will use the direct return for simplicity.
-
-    o_ref, l_ref = _attention_and_lse(q, k, v, is_causal)
-
-    # Check for close approximation
-    try:
-        torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
-        torch.testing.assert_close(l, l_ref, rtol=1e-2, atol=1e-2)
-        return True, None
-    except AssertionError as e:
-        return False, str(e)
-
-
-def test_flash_forward_pass_triton(is_causal):
-    # This is the actual test function from the user's prompt
-    return _test_flash_forward_pass(
-        get_flashattention_autograd_function_triton().apply,
-        device="cuda",
-        is_causal=is_causal,
-    )
-
-
-if __name__ == "__main__":
-    import sys
-
-    if not torch.cuda.is_available():
-        print("A GPU must be available to run this test. Skipping.")
-        sys.exit(0)
-
-    print("Running FlashAttention Triton forward pass test...")
-    print("--------------------------------------------------")
-
-    # Test for non-causal attention
-    is_causal = False
-    print(f"Testing with is_causal={is_causal}...")
-    success, error_msg = test_flash_forward_pass_triton(is_causal)
-    if success:
-        print("✅ Non-causal forward pass test PASSED!")
-    else:
-        print("❌ Non-causal forward pass test FAILED.")
-        print("Error details:", error_msg)
-
-    print("\n" + "=" * 50 + "\n")
+    def backward(ctx, grad_output):
+        """
+        PyTorch implementation of attention backward pass using saved L values.
+        
+        The attention mechanism is: O = softmax(Q @ K.T / scale) @ V
+        We use the saved L (log-sum-exp) values to efficiently reconstruct P = softmax(S).
+        
+        Mathematical derivation:
+        - S = Q @ K.T * scale
+        - P = exp(S - L[:, None]) where L = logsumexp(S, dim=-1)
+        - O = P @ V
+        - dV = P.T @ dO
+        - dP = dO @ V.T
+        - dS = dP ⊙ P - P ⊙ (dP ⊙ P).sum(dim=-1, keepdim=True)  [softmax backward]
+        - dQ = dS @ K * scale
+        - dK = dS.T @ Q * scale
+        """
+        Q, K, V, O, L = ctx.saved_tensors
+        scale = ctx.scale
+        is_causal = ctx.is_causal
+        
+        batch_size, n_queries, d = Q.shape
+        _, n_keys, _ = K.shape
+        
+        # Initialize gradients
+        grad_Q = torch.zeros_like(Q) if Q.requires_grad else None
+        grad_K = torch.zeros_like(K) if K.requires_grad else None
+        grad_V = torch.zeros_like(V) if V.requires_grad else None
+        
+        # Process each batch independently
+        for b in range(batch_size):
+            q_b = Q[b]  # (n_queries, d)
+            k_b = K[b]  # (n_keys, d)
+            v_b = V[b]  # (n_keys, d)
+            L_b = L[b]  # (n_queries,)
+            grad_output_b = grad_output[b]  # (n_queries, d)
+            
+            # Recompute S = Q @ K.T * scale
+            S = torch.matmul(q_b, k_b.transpose(-1, -2)) * scale  # (n_queries, n_keys)
+            
+            # Apply causal mask if needed
+            if is_causal:
+                causal_mask = torch.tril(torch.ones(n_queries, n_keys, device=S.device, dtype=torch.bool))
+                S = S.masked_fill(~causal_mask, float('-inf'))
+            
+            # Efficiently compute P using saved L values
+            # P = exp(S - L[:, None]) is more numerically stable than softmax(S)
+            P = torch.exp(S - L_b[:, None])  # (n_queries, n_keys)
+            
+            # Backward pass
+            if grad_V is not None:
+                # dV = P.T @ dO
+                grad_V[b] = torch.matmul(P.transpose(-1, -2), grad_output_b)
+            
+            if grad_Q is not None or grad_K is not None:
+                # dP = dO @ V.T
+                dP = torch.matmul(grad_output_b, v_b.transpose(-1, -2))  # (n_queries, n_keys)
+                
+                # Apply causal mask to gradients if needed
+                if is_causal:
+                    causal_mask = torch.tril(torch.ones(n_queries, n_keys, device=dP.device, dtype=torch.bool))
+                    dP = dP.masked_fill(~causal_mask, 0.0)
+                
+                # Softmax backward: dS = dP ⊙ P - P ⊙ (dP ⊙ P).sum(dim=-1, keepdim=True)
+                # This is equivalent to: dS = P * (dP - (dP * P).sum(dim=-1, keepdim=True))
+                dP_P_sum = (dP * P).sum(dim=-1, keepdim=True)  # (n_queries, 1)
+                dS = P * (dP - dP_P_sum)  # (n_queries, n_keys)
+                
+                if grad_Q is not None:
+                    # dQ = dS @ K * scale
+                    grad_Q[b] = torch.matmul(dS, k_b) * scale
+                
+                if grad_K is not None:
+                    # dK = dS.T @ Q * scale
+                    grad_K[b] = torch.matmul(dS.transpose(-1, -2), q_b) * scale
+        
+        # Return gradients in the same order as forward inputs
+        # forward: (Q, K, V, scale, is_causal, Q_TILE_SIZE, K_TILE_SIZE)
+        return grad_Q, grad_K, grad_V, None, None, None, None
