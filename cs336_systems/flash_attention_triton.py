@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 
-# Triton kernel stub
+# Triton kernel with causal masking support
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr,
@@ -31,10 +31,14 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr,  # Added causal flag
 ):
     # Program indices
     query_tile_index = tl.program_id(0)
     batch_index = tl.program_id(1)
+
+    # Calculate starting query index for this tile
+    start_q = query_tile_index * Q_TILE_SIZE
 
     # Offset each pointer with the corresponding batch index
     # multiplied with the batch stride for each tensor
@@ -42,7 +46,7 @@ def flash_fwd_kernel(
         Q_ptr + batch_index * stride_qb,
         shape=(N_QUERIES, D),
         strides=(stride_qq, stride_qd),
-        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        offsets=(start_q, 0),
         block_shape=(Q_TILE_SIZE, D),
         order=(1, 0),
     )
@@ -53,7 +57,7 @@ def flash_fwd_kernel(
         strides=(stride_kk, stride_kd),
         offsets=(0, 0),
         block_shape=(K_TILE_SIZE, D),
-        order=(0, 1),
+        order=(1, 0),
     )
 
     V_block_ptr = tl.make_block_ptr(
@@ -62,14 +66,14 @@ def flash_fwd_kernel(
         strides=(stride_vk, stride_vd),
         offsets=(0, 0),
         block_shape=(K_TILE_SIZE, D),
-        order=(0, 1),
+        order=(1, 0),
     )
 
     O_block_ptr = tl.make_block_ptr(
         O_ptr + batch_index * stride_ob,
         shape=(N_QUERIES, D),
         strides=(stride_oq, stride_od),
-        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        offsets=(start_q, 0),
         block_shape=(Q_TILE_SIZE, D),
         order=(1, 0),
     )
@@ -78,25 +82,38 @@ def flash_fwd_kernel(
         L_ptr + batch_index * stride_lb,
         shape=(N_QUERIES, 1),
         strides=(stride_lq, 1),
-        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        offsets=(start_q, 0),
         block_shape=(Q_TILE_SIZE, 1),
         order=(1, 0),
     )
 
-    q_mask = (query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE) < N_QUERIES)[
-        :, None
-    ]
-    q = tl.load(Q_block_ptr, mask=q_mask, other=0.0)
+    q = tl.load(Q_block_ptr).to(tl.float32)
 
     o_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
     l_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
     m_i = tl.full((Q_TILE_SIZE,), -float("inf"), dtype=tl.float32)
 
-    for _ in range(0, N_KEYS, K_TILE_SIZE):
-        k = tl.load(K_block_ptr, mask=None, other=0.0)
-        v = tl.load(V_block_ptr, mask=None, other=0.0)
+    # Create query indices for causal masking
+    if is_causal:
+        q_indices = start_q + tl.arange(0, Q_TILE_SIZE)
 
-        s = tl.dot(q, k) / scale
+    for start_k in range(0, N_KEYS, K_TILE_SIZE):
+        # Load K and V, cast them to float32
+        k = tl.load(K_block_ptr).to(tl.float32)
+        v = tl.load(V_block_ptr).to(tl.float32)
+
+        s = tl.dot(q, tl.trans(k)) * scale
+
+        # Apply causal masking if enabled
+        if is_causal:
+            # Create key indices for this tile
+            k_indices = start_k + tl.arange(0, K_TILE_SIZE)
+
+            # Create causal mask: query_idx >= key_idx (lower triangular)
+            causal_mask = q_indices[:, None] >= k_indices[None, :]
+
+            # Apply mask: set masked positions to -1e6
+            s = tl.where(causal_mask, s, -1e6)
 
         m_i_new = tl.maximum(m_i, tl.max(s, 1))
         s = tl.exp(s - m_i_new[:, None])
@@ -105,21 +122,22 @@ def flash_fwd_kernel(
         o_i = tl.exp(m_i - m_i_new)[:, None] * o_i + tl.dot(s, v)
         m_i = m_i_new
 
-    o_final = o_i / tl.exp(l_i)[:, None]
+        K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
+        V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
+
+    o_final = o_i / l_i[:, None]
     l_final = tl.log(l_i) + m_i
 
-    row_mask = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE) < N_QUERIES
-
-    tl.store(O_block_ptr, o_final, mask=row_mask[:, None])
-    tl.store(L_block_ptr, l_final, mask=row_mask)
+    tl.store(O_block_ptr, o_final)
+    tl.store(L_block_ptr, l_final[:, None])
 
 
-# torch.autograd.Function subclass stub
+# torch.autograd.Function subclass with causal masking support
 class FlashAttentionTriton(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, Q, K, V, scale, Q_TILE_SIZE=128, K_TILE_SIZE=128):
-        # Store for backward pass (if needed)
-        # ctx.save_for_backward(...)
+    def forward(ctx, Q, K, V, scale, is_causal=False, Q_TILE_SIZE=128, K_TILE_SIZE=128):
+        # Store for backward pass
+        ctx.is_causal = is_causal
 
         # Get tensor properties
         batch_size, N_QUERIES, D = Q.shape
@@ -159,13 +177,16 @@ class FlashAttentionTriton(torch.autograd.Function):
             D,
             Q_TILE_SIZE,
             K_TILE_SIZE,
+            is_causal,  # Pass the causal flag
         )
         return O, L
 
     @staticmethod
     def backward(ctx, grad_output, grad_L):
         # Backward pass logic goes here
-        return None, None, None, None, None, None
+        # Can access ctx.is_causal for causal-aware backward pass
+        return None, None, None, None, None, None, None
+
 
 # Adapter function to match the test suite's import structure
 def get_flashattention_autograd_function_triton():
@@ -176,17 +197,29 @@ def _attention_and_lse(q, k, v, is_causal=False):
     n_queries = q.shape[-2]
     n_keys = k.shape[-2]
     d = q.shape[-1]
-    scale = 1 / (d ** 0.5)
-    S = torch.einsum(q, k, '... q d, ... k d -> ... q k') * scale
+    scale = 1 / (d**0.5)
+
+    # Replaces S = torch.einsum(q, k, "... q d, ... k d -> ... q k") * scale
+    k_transposed = k.transpose(-2, -1)
+    S = torch.matmul(q, k_transposed) * scale
+
     if is_causal:
         S = torch.where(
-            torch.arange(n_queries, device=S.device)[None, :, None] >= torch.arange(n_keys, device=S.device)[None, None, :],
+            torch.arange(n_queries, device=S.device)[None, :, None]
+            >= torch.arange(n_keys, device=S.device)[None, None, :],
             S,
-            -1e6
+            torch.full_like(S, float("-inf")),
         )
+
+    # Use torch.softmax on the last dimension
     P = torch.softmax(S, dim=-1)
-    o = torch.einsum(P, v, '... q k, ... k d -> ... q d')
+
+    # Replaces o = torch.einsum(P, v, "... q k, ... k d -> ... q d")
+    o = torch.matmul(P, v)
+
+    # torch.logsumexp is still the same
     L = torch.logsumexp(S, dim=-1)
+
     return o, L
 
 
@@ -205,7 +238,11 @@ def _make_attn_inputs(device=None):
 
 def _test_flash_forward_pass(impl, device="cpu", is_causal=False):
     q, k, v, _do = _make_attn_inputs(device)
-    o, l = impl(q, k, v, is_causal)
+    D = q.shape[-1]
+    scale = 1.0 / (D**0.5)
+
+    # Call implementation with causal flag
+    o, l = impl(q, k, v, scale, is_causal)
 
     # In the original test, `l` is extracted from saved tensors.
     # The provided FlashAttentionTriton returns `o, l` directly.
@@ -233,6 +270,7 @@ def test_flash_forward_pass_triton(is_causal):
 
 if __name__ == "__main__":
     import sys
+
     if not torch.cuda.is_available():
         print("A GPU must be available to run this test. Skipping.")
         sys.exit(0)
@@ -261,4 +299,6 @@ if __name__ == "__main__":
     else:
         print("❌ Causal forward pass test FAILED.")
         print("Error details:", error_msg)
-        print("\nNote: The provided Triton kernel does not implement causality, so this test will fail.")
+
+    print("\n" + "=" * 50 + "\n")
+    print("All tests completed!")
