@@ -40,7 +40,7 @@ def get_tile_sizes(seq_len, d_model):
     if d_model >= 128:
         # Use smaller tiles for large head dims
         q_tile = min(16, seq_len)
-        k_tile = min(16, seq_len)
+        k_tile = min(128, seq_len)
     elif d_model >= 64:
         q_tile = min(16, seq_len)
         k_tile = min(16, seq_len)
